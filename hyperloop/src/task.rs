@@ -1,216 +1,148 @@
+//! Async task with priority
 use core::{
-    lazy::OnceCell,
     pin::Pin,
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    task::{Context, Poll, Waker},
 };
 
-use atomig::{Atom, Atomic, Ordering};
 use futures::Future;
 
-use crate::executor::{Priority, TaskSender, Ticket};
+/// Task priority
+pub type Priority = u8;
 
-unsafe fn clone<F: Future<Output = ()> + 'static>(ptr: *const ()) -> RawWaker {
-    let task = &*(ptr as *const Task<F>);
-
-    RawWaker::new(ptr, &task.vtable)
-}
-
-unsafe fn wake<F: Future<Output = ()> + 'static>(ptr: *const ()) {
-    let task = &*(ptr as *const Task<F>);
-    task.wake();
-}
-
-unsafe fn drop(_ptr: *const ()) {}
-
-pub(crate) trait PollTask {
-    unsafe fn poll(&self) -> Poll<()>;
-}
-
-#[repr(u8)]
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Atom)]
-enum TaskState {
-    NotQueued,
-    Queued,
-}
-
+/// Async task with priority
+///
+/// # Example
+///```
+/// use hyperloop::task::Task;
+///
+/// async fn task_fn() {
+/// }
+///
+/// let task = Task::new(task_fn(), 1);
+/// ```
 pub struct Task<F>
 where
     F: Future<Output = ()> + 'static,
 {
     future: F,
     priority: Priority,
-    sender: OnceCell<TaskSender>,
-    vtable: RawWakerVTable,
-    state: Atomic<TaskState>,
 }
 
 impl<F> Task<F>
 where
     F: Future<Output = ()> + 'static,
 {
-    pub fn new(future_fn: impl FnOnce() -> F, priority: Priority) -> Self {
-        Self {
-            future: future_fn(),
-            priority,
-            sender: OnceCell::new(),
-            vtable: RawWakerVTable::new(clone::<F>, wake::<F>, wake::<F>, drop),
-            state: Atomic::new(TaskState::NotQueued),
-        }
+    /// Create new task from future with given priority
+    pub fn new(future: F, priority: Priority) -> Self {
+        Self { future, priority }
     }
 
-    fn update_state(&self, old: TaskState, new: TaskState) -> bool {
-        if let Ok(_) = self
-            .state
-            .compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed)
-        {
-            true
-        } else {
-            false
-        }
+    /// Return handle to pinned task
+    pub fn get_handle(self: Pin<&mut Self>) -> TaskHandle {
+        TaskHandle::new(self)
     }
+}
 
-    #[cfg(test)]
-    fn get_state(&self) -> TaskState {
-        self.state.load(Ordering::Relaxed)
-    }
+/// Type erased handle for `Task`
+pub struct TaskHandle {
+    future: *mut (),
+    poll: fn(*mut (), &mut Context<'_>) -> Poll<()>,
+    pub priority: Priority,
+}
 
-    unsafe fn as_static(&self) -> &'static Self {
-        &*(self as *const Self)
-    }
+impl TaskHandle {
+    fn new<F: Future<Output = ()>>(task: Pin<&mut Task<F>>) -> Self {
+        unsafe {
+            let task = Pin::get_unchecked_mut(task);
 
-    unsafe fn as_mut(&self) -> &mut Self {
-        &mut *((self as *const Self) as *mut Self)
-    }
-
-    unsafe fn get_waker(&self) -> Waker {
-        let ptr: *const () = (self as *const Task<F>).cast();
-        let vtable = &self.as_static().vtable;
-
-        Waker::from_raw(RawWaker::new(ptr, vtable))
-    }
-
-    pub fn wake(&self) {
-        self.schedule().unwrap();
-    }
-
-    pub fn add_to_executor(&self, sender: TaskSender) -> Result<(), ()> {
-        self.set_sender(sender)?;
-        self.schedule()
-    }
-
-    fn set_sender(&self, sender: TaskSender) -> Result<(), ()> {
-        match self.sender.set(sender) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(()),
-        }
-    }
-
-    fn send_ticket(&self, ticket: Ticket) -> Result<(), ()> {
-        if let Some(sender) = self.sender.get() {
-            if let Ok(_) = sender.send(ticket) {
-                return Ok(());
+            Self {
+                future: &mut task.future as *mut F as *mut (),
+                poll: core::mem::transmute::<
+                    fn(Pin<&mut F>, &mut Context<'_>) -> Poll<F::Output>,
+                    fn(*mut (), &mut Context<'_>) -> Poll<()>,
+                >(F::poll),
+                priority: task.priority,
             }
         }
-
-        Err(())
     }
 
-    fn schedule(&self) -> Result<(), ()> {
-        if self.update_state(TaskState::NotQueued, TaskState::Queued) {
-            let ticket = Ticket::new(self as *const Self, self.priority);
+    /// Poll task with given waker
+    pub fn poll(&mut self, waker: Waker) -> Poll<()> {
+        let mut cx = Context::from_waker(&waker);
 
-            match self.send_ticket(ticket) {
-                Ok(_) => Ok(()),
-                Err(_) => {
-                    assert!(self.update_state(TaskState::Queued, TaskState::NotQueued));
-                    Err(())
-                }
-            }
+        let poll = self.poll;
+
+        poll(self.future, &mut cx)
+    }
+}
+
+#[derive(Debug)]
+struct YieldFuture {
+    done: bool,
+}
+
+impl YieldFuture {
+    fn new() -> Self {
+        Self { done: false }
+    }
+}
+
+impl Future for YieldFuture {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.done {
+            self.done = true;
+            cx.waker().wake_by_ref();
+
+            Poll::Pending
         } else {
-            Ok(())
+            Poll::Ready(())
         }
     }
 }
 
-impl<F> PollTask for Task<F>
-where
-    F: Future<Output = ()> + 'static,
-{
-    unsafe fn poll(&self) -> Poll<()> {
-        let waker = self.get_waker();
-        let mut cx = Context::from_waker(&waker);
-        let future = Pin::new_unchecked(&mut self.as_mut().future);
-
-        assert!(self.update_state(TaskState::Queued, TaskState::NotQueued));
-        let result = future.poll(&mut cx);
-
-        result
-    }
+/// Yield task
+pub fn yield_now() -> impl Future<Output = ()> {
+    YieldFuture::new()
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        interrupt::yield_now,
-        priority_queue::{Max, PriorityQueue},
-    };
+    use crossbeam_queue::ArrayQueue;
+    use std::sync::Arc;
+
+    use crate::common::tests::MockWaker;
 
     use super::*;
 
     #[test]
     fn task() {
-        let mut queue: PriorityQueue<Ticket, Max, 1> = PriorityQueue::new();
+        let queue = Arc::new(ArrayQueue::new(10));
 
-        let test_future = || {
-            || {
-                async fn future() {
-                    loop {
-                        yield_now().await
-                    }
+        let test_future = |queue| {
+            async fn future(queue: Arc<ArrayQueue<u32>>) {
+                for i in 0.. {
+                    queue.push(i).unwrap();
+                    yield_now().await;
                 }
-
-                future()
             }
+
+            future(queue)
         };
 
-        let task = Task::new(test_future(), 1);
+        let mut task = Task::new(test_future(queue.clone()), 1);
+        let mut handle = unsafe { Pin::new_unchecked(&mut task).get_handle() };
+        let waker: Waker = Arc::new(MockWaker::new()).into();
 
-        task.set_sender(queue.get_sender()).unwrap();
+        assert_eq!(handle.poll(waker.clone()), Poll::Pending);
 
-        assert_eq!(task.get_state(), TaskState::NotQueued);
-
-        task.schedule().unwrap();
-
-        assert_eq!(task.get_state(), TaskState::Queued);
-
-        assert!(queue.pop().is_some());
+        assert_eq!(queue.pop().unwrap(), 0);
         assert!(queue.pop().is_none());
 
-        task.schedule().unwrap();
+        assert_eq!(handle.poll(waker.clone()), Poll::Pending);
 
-        assert!(queue.pop().is_none());
-
-        unsafe {
-            assert_eq!(task.poll(), Poll::Pending);
-        }
-
-        assert_eq!(task.get_state(), TaskState::NotQueued);
-
-        task.wake();
-        task.wake();
-        task.wake();
-
-        assert_eq!(task.get_state(), TaskState::Queued);
-
-        assert!(queue.pop().is_some());
-        assert!(queue.pop().is_none());
-
-        task.wake();
-        task.wake();
-        task.wake();
-
-        assert_eq!(task.get_state(), TaskState::Queued);
-
+        assert_eq!(queue.pop().unwrap(), 1);
         assert!(queue.pop().is_none());
     }
 }

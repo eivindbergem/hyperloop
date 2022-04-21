@@ -1,14 +1,16 @@
-#![no_std]
-
-use core::{marker::PhantomData, ops::Deref, sync::atomic::Ordering};
+use core::{cell::UnsafeCell, marker::PhantomData, mem, pin::Pin, sync::atomic::Ordering};
 
 #[cfg(not(loom))]
 use core::sync::atomic::AtomicUsize;
+
+#[cfg(test)]
+use core::ops::Deref;
 
 #[cfg(loom)]
 use loom::sync::atomic::AtomicUsize;
 
 use crossbeam_utils::Backoff;
+use pinned_aliasable::Aliasable;
 
 pub enum HeapKind {
     Max,
@@ -83,10 +85,8 @@ where
             } else {
                 return Some(right);
             }
-        } else {
-            if let Some(left) = left {
-                return Some(left);
-            }
+        } else if let Some(left) = left {
+            return Some(left);
         }
 
         None
@@ -102,9 +102,10 @@ where
     }
 
     fn item(&self) -> &T {
-        self.heap.slots[self.pos].as_ref().unwrap()
+        unsafe { self.heap.slot_mut(self.pos).as_ref().unwrap() }
     }
 
+    #[allow(clippy::mut_from_ref)]
     unsafe fn slot_mut(&self) -> &mut Option<T> {
         self.heap.slot_mut(self.pos)
     }
@@ -113,10 +114,7 @@ where
         let slot = unsafe { self.slot_mut() };
         let other_slot = unsafe { other.slot_mut() };
 
-        let item = slot.take();
-        *slot = other_slot.take();
-        *other_slot = item;
-
+        mem::swap(slot, other_slot);
         other
     }
 
@@ -187,7 +185,7 @@ impl AtomicStackPosition {
 
     fn compare_exchange(&self, current: usize, new: usize) -> Result<usize, usize> {
         self.atomic
-            .compare_exchange_weak(current, new, Ordering::Release, Ordering::Relaxed)
+            .compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Relaxed)
     }
 }
 
@@ -195,36 +193,44 @@ pub struct PrioritySender<T>
 where
     T: 'static,
 {
-    slots: &'static [Option<T>],
-    available: &'static AtomicUsize,
-    stack_pos: &'static AtomicStackPosition,
+    slots: *const [UnsafeCell<Option<T>>],
+    available: *const AtomicUsize,
+    stack_pos: *const AtomicStackPosition,
 }
 
 impl<T> Clone for PrioritySender<T> {
     fn clone(&self) -> Self {
         Self {
-            slots: self.slots.clone(),
-            available: self.available.clone(),
-            stack_pos: self.stack_pos.clone(),
+            slots: self.slots,
+            available: self.available,
+            stack_pos: self.stack_pos,
         }
     }
 }
 
+unsafe impl<T> Send for PrioritySender<T> {}
+unsafe impl<T> Sync for PrioritySender<T> {}
+
 impl<T> PrioritySender<T> {
+    #[allow(clippy::mut_from_ref)]
     unsafe fn slot_mut(&self, index: usize) -> &mut Option<T> {
-        &mut *((&self.slots[index] as *const Option<T>) as *mut Option<T>)
+        let slots = &*self.slots;
+
+        &mut *slots[index].get()
     }
 
     fn stack_push(&self, item: T) -> Result<(), T> {
+        let stack_pos = unsafe { &*self.stack_pos };
+
         loop {
-            let current = self.stack_pos.load();
+            let current = stack_pos.load();
 
             if current.pos() > 0 {
                 let new = current.reserved();
 
-                if let Ok(_) = self
-                    .stack_pos
+                if stack_pos
                     .compare_exchange(current.value(), new.value())
+                    .is_ok()
                 {
                     let slot = unsafe { self.slot_mut(new.pos()) };
                     *slot = Some(item);
@@ -236,10 +242,10 @@ impl<T> PrioritySender<T> {
         }
 
         loop {
-            let old = self.stack_pos.load();
+            let old = stack_pos.load();
             let new = old.pushed();
 
-            if let Ok(_) = self.stack_pos.compare_exchange(old.value(), new.value()) {
+            if stack_pos.compare_exchange(old.value(), new.value()).is_ok() {
                 break;
             }
         }
@@ -248,16 +254,21 @@ impl<T> PrioritySender<T> {
     }
 
     pub fn send(&self, item: T) -> Result<(), T> {
-        loop {
-            let available = self.available.load(Ordering::Acquire);
+        let available = unsafe { &*self.available };
 
-            if available > 0 {
-                if let Ok(_) = self.available.compare_exchange(
-                    available,
-                    available - 1,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
+        loop {
+            let n_available = available.load(Ordering::Acquire);
+
+            if n_available > 0 {
+                if available
+                    .compare_exchange(
+                        n_available,
+                        n_available - 1,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
                     break;
                 }
             } else {
@@ -269,6 +280,7 @@ impl<T> PrioritySender<T> {
     }
 }
 
+#[cfg(test)]
 pub struct PeekMut<'a, T, K, const N: usize>
 where
     T: PartialOrd,
@@ -277,6 +289,7 @@ where
     queue: &'a mut PriorityQueue<T, K, N>,
 }
 
+#[cfg(test)]
 impl<'a, T, K, const N: usize> PeekMut<'a, T, K, N>
 where
     T: PartialOrd + 'static,
@@ -287,15 +300,16 @@ where
     }
 }
 
+#[cfg(test)]
 impl<'a, T, K, const N: usize> Deref for PeekMut<'a, T, K, N>
 where
-    T: PartialOrd,
-    K: Kind,
+    T: PartialOrd + 'static,
+    K: Kind + 'static,
 {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.queue.slots[0].as_ref().unwrap()
+        unsafe { self.queue.slot_mut(0).as_ref().unwrap() }
     }
 }
 
@@ -304,7 +318,7 @@ where
     T: PartialOrd,
     K: Kind,
 {
-    slots: [Option<T>; N],
+    slots: Aliasable<[UnsafeCell<Option<T>>; N]>,
     available: AtomicUsize,
     stack_pos: AtomicStackPosition,
     heap_size: usize,
@@ -318,7 +332,7 @@ where
 {
     pub fn new() -> Self {
         Self {
-            slots: [(); N].map(|_| None),
+            slots: Aliasable::new([(); N].map(|_| UnsafeCell::new(None))),
             available: AtomicUsize::new(N),
             stack_pos: AtomicStackPosition::new(N),
             heap_size: 0,
@@ -326,18 +340,21 @@ where
         }
     }
 
-    pub fn get_sender(&self) -> PrioritySender<T> {
-        let queue: &'static Self = unsafe { &*(self as *const Self) };
+    pub unsafe fn get_sender(&self) -> PrioritySender<T> {
+        let queue: &'static Self = &*(self as *const Self);
+        let slots = Aliasable::get(Pin::new_unchecked(&self.slots)) as *const _;
 
         PrioritySender {
-            slots: &queue.slots,
+            slots,
             available: &queue.available,
             stack_pos: &queue.stack_pos,
         }
     }
 
+    #[allow(clippy::mut_from_ref)]
     unsafe fn slot_mut(&self, index: usize) -> &mut Option<T> {
-        &mut *((&self.slots[index] as *const Option<T>) as *mut Option<T>)
+        let slots = Aliasable::get(Pin::new_unchecked(&self.slots));
+        &mut *slots[index].get()
     }
 
     fn get_node(&self, index: usize) -> Node<T, K, N> {
@@ -364,15 +381,18 @@ where
                 break Err(());
             } else {
                 let new = current.popped();
-                let item = self.slots[current.pos()].take();
+                let item = unsafe { self.slot_mut(current.pos()).take() };
 
-                if let Ok(_) = self
+                if self
                     .stack_pos
                     .compare_exchange(current.value(), new.value())
+                    .is_ok()
                 {
                     break Ok(item);
                 } else {
-                    self.slots[current.pos()] = item;
+                    unsafe {
+                        *self.slot_mut(current.pos()) = item;
+                    }
                 }
             }
         }
@@ -407,7 +427,9 @@ where
         let index = self.heap_size;
 
         if index < N {
-            self.slots[index] = Some(item);
+            unsafe {
+                *self.slot_mut(index) = Some(item);
+            }
 
             self.heap_size += 1;
 
@@ -431,17 +453,23 @@ where
     }
 
     fn take_root(&mut self) -> Option<T> {
-        if let Some(item) = self.slots[0].take() {
-            {
-                let root = self.get_root();
-                let last = self.get_last();
-                last.swap(root);
-            }
-            self.heap_size -= 1;
+        match self.heap_size.cmp(&1) {
+            core::cmp::Ordering::Greater => {
+                let item = unsafe { self.slot_mut(0).take() }.unwrap();
+                {
+                    let root = self.get_root();
+                    let last = self.get_last();
+                    last.swap(root);
+                }
+                self.heap_size -= 1;
 
-            Some(item)
-        } else {
-            None
+                Some(item)
+            }
+            core::cmp::Ordering::Equal => {
+                self.heap_size -= 1;
+                Some(unsafe { self.slot_mut(0).take() }.unwrap())
+            }
+            core::cmp::Ordering::Less => None,
         }
     }
 
@@ -473,12 +501,16 @@ where
             loop {
                 let available = self.available.load(Ordering::Acquire);
 
-                if let Ok(_) = self.available.compare_exchange(
-                    available,
-                    available + 1,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
+                if self
+                    .available
+                    .compare_exchange(
+                        available,
+                        available + 1,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
                     break Some(item);
                 }
             }
@@ -487,7 +519,8 @@ where
         }
     }
 
-    pub fn peek_mut<'a>(&'a mut self) -> Option<PeekMut<'a, T, K, N>> {
+    #[cfg(test)]
+    pub fn peek_mut(&mut self) -> Option<PeekMut<'_, T, K, N>> {
         self.sort();
 
         if self.heap_size > 0 {
@@ -498,12 +531,20 @@ where
     }
 }
 
+impl<T, K, const N: usize> Default for PriorityQueue<T, K, N>
+where
+    T: PartialOrd + 'static,
+    K: Kind + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(not(loom))]
 #[cfg(test)]
 mod tests {
-    use std::thread;
-
-    use std::vec::Vec;
+    use std::{thread, vec::Vec};
 
     use super::*;
 
@@ -540,7 +581,7 @@ mod tests {
     #[test]
     fn stack() {
         let mut heap: PriorityQueue<u32, Min, 10> = PriorityQueue::new();
-        let sender = heap.get_sender();
+        let sender = unsafe { heap.get_sender() };
 
         for i in 0..10 {
             sender.stack_push(i).unwrap();
@@ -568,7 +609,7 @@ mod tests {
     #[test]
     fn channel() {
         let mut queue: PriorityQueue<u32, Min, 10> = PriorityQueue::new();
-        let sender = queue.get_sender();
+        let sender = unsafe { queue.get_sender() };
 
         for i in 0..10 {
             sender.send(i).unwrap();
@@ -608,6 +649,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn channel_thread() {
         const N: usize = 1000;
         let mut queue: PriorityQueue<u128, Min, N> = PriorityQueue::new();
@@ -619,13 +661,13 @@ mod tests {
         let n_items = n_threads * n_items_per_thread;
 
         for i in 0..n_threads {
-            let sender = queue.get_sender();
+            let sender = unsafe { queue.get_sender() };
             let handler = thread::spawn(move || {
                 for j in 0..n_items_per_thread {
                     loop {
                         let item = i * n_items_per_thread + j;
 
-                        if let Ok(_) = sender.send(item) {
+                        if sender.send(item).is_ok() {
                             break;
                         }
 
@@ -660,10 +702,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[macro_use]
-extern crate std;
-
-#[cfg(test)]
 #[cfg(loom)]
 mod tests_loom {
     use std::boxed::Box;
@@ -683,7 +721,7 @@ mod tests_loom {
 
             let handles: Vec<_> = (0..n_threads)
                 .map(|i| {
-                    let sender = queue.get_sender();
+                    let sender = unsafe { queue.get_sender() };
                     thread::spawn(move || {
                         sender.stack_push(i).unwrap();
                     })
