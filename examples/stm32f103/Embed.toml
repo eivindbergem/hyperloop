@@ -1,0 +1,5 @@
+[default.rtt]
+enabled = true
+channels = [
+    { up = 0, name = "defmt_rtt", format = "Defmt" },
+]

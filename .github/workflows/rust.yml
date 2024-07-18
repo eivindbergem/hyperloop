@@ -10,17 +10,87 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  readme:
+    runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: ./hyperloop
+
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/install@v0.1
+        with:
+          crate: cargo-readme
+          version: latest
+          use-tool-cache: true
+      - name: Readme
+        run: cargo readme > ../README.md && git diff --exit-code
+
+  format:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - name: Format
       run: cargo fmt --all -- --check
+    
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --verbose
+      run: cd hyperloop && cargo build --verbose
+
+  build-std-example:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: cd examples/std && cargo build --verbose
+
+  build-stm32f03-example:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: nightly
+        target: thumbv7m-none-eabi
+
+    - name: Build
+      run: cd examples/stm32f103 && cargo build --verbose
+      
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
     - name: Run tests
-      run: cargo test --verbose
+      run: cd hyperloop && cargo test --verbose --all-features
+
+  loom:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
     - name: Loom tests
-      run: RUSTFLAGS="--cfg loom" cargo test --release tests_loom
+      run: cd hyperloop && RUSTFLAGS="--cfg loom" cargo test --release tests_loom
+
+  miri:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: nightly
+        override: true
+        components: miri
+    - name: Miri tests
+      run: cd hyperloop && cargo miri test --verbose --all-features

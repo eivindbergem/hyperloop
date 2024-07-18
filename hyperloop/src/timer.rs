@@ -1,185 +1,335 @@
+//! Timer for delaying tasks and getting timestamp
+//!
+//! [`TimerQueue`] requires a hardware timer that implements
+//! [`HardwareTimer`]. Two reference implementations are provided:
+//! - [`cortex_m::SysTickTimer`] - A systick-based timer for Cortex-M systems
+//! - [`std::StdTimer`] - A standard library based timer for testing in software
+
 use core::{
+    cell::UnsafeCell,
+    ops::{Add, AddAssign},
     pin::Pin,
     task::{Context, Poll, Waker},
 };
 
-use embedded_time::{
-    duration::{Duration, Milliseconds},
-    fixed_point::FixedPoint,
-    rate::{Hertz, Rate},
-};
-
 use core::future::Future;
-use futures::{task::AtomicWaker, Stream, StreamExt};
-use log::error;
+use pinned_aliasable::Aliasable;
 
-use crate::priority_queue::{Min, PeekMut, PriorityQueue, PrioritySender};
+use self::list::{List, Node};
 
-type Tick = u64;
+mod list;
 
-pub struct TickCounter {
-    count: Tick,
-    waker: AtomicWaker,
+#[cfg(feature = "cortex-m")]
+#[doc(cfg(feature = "cortex-m"))]
+pub mod cortex_m;
+
+#[cfg(feature = "std")]
+#[doc(cfg(feature = "std"))]
+pub mod std;
+
+/// Trait for interfacing with hardware timers.
+///
+/// Should provide monotonic time and the ability to set alarms. Check
+/// out `systick::SysTickTimer` for a reference implementation.
+pub trait HardwareTimer {
+    type Instant: Ord
+        + Eq
+        + Copy
+        + AddAssign<Self::Duration>
+        + Add<Self::Duration, Output = Self::Instant>;
+    type Duration: Copy;
+
+    /// Start timer
+    fn start(&self);
+
+    /// Return current time
+    fn now(&self) -> Self::Instant;
+
+    /// Set alarm expiring at given instant. If None is provided, the
+    /// alarm should be set to the maximum delay
+    fn set_alarm(&self, expires: Option<Self::Instant>);
+
+    /// Block until alarm expires
+    fn wait_for_alarm(&self);
 }
 
-impl TickCounter {
-    pub const fn new() -> Self {
+/// Timer queue for delayed tasks
+pub struct TimerQueue<HW>
+where
+    HW: HardwareTimer,
+{
+    hw: UnsafeCell<HW>,
+    queue: UnsafeCell<List<Ticket<HW::Instant>>>,
+}
+
+unsafe impl<HW> Sync for TimerQueue<HW> where HW: HardwareTimer {}
+unsafe impl<HW> Send for TimerQueue<HW> where HW: HardwareTimer {}
+
+impl<HW> TimerQueue<HW>
+where
+    HW: HardwareTimer,
+{
+    /// Create new timer queue
+    pub fn new(hw: HW) -> Self {
+        hw.start();
+
         Self {
-            count: 0,
-            waker: AtomicWaker::new(),
+            hw: UnsafeCell::new(hw),
+            queue: UnsafeCell::new(List::new()),
         }
     }
 
-    /// Increment tick count
-    ///
-    /// # Safety
-    ///
-    /// Updating the tick value is not atomic on 32-bit systems, so it
-    /// would be possible to get an invalid reading if reading during
-    /// a write. For this reason, this function should only be called
-    /// from a high priority interrupt handler.
-    pub unsafe fn increment(&mut self) {
-        self.count += 1;
-    }
+    /// Return next exired waker, if any
+    fn next_waker(&self) -> Option<Waker> {
+        let queue = unsafe { &mut *self.queue.get() };
+        let hw = unsafe { &*self.hw.get() };
 
-    pub fn wake(&self) {
-        self.waker.wake();
-    }
+        if let Some(peek) = queue.peek_mut() {
+            let ticket = peek.get();
 
-    pub unsafe fn tick(&mut self) {
-        self.increment();
-        self.wake();
-    }
-
-    pub fn get_token(&self) -> TickCounterToken {
-        TickCounterToken {
-            counter: unsafe { &*(self as *const Self) },
+            if hw.now() > ticket.expires {
+                let waker = ticket.waker.clone();
+                unsafe { peek.pop() };
+                return Some(waker);
+            }
         }
+
+        None
+    }
+
+    /// Get time of next expiring waker
+    fn next_expiration(&self) -> Option<HW::Instant> {
+        let queue = unsafe { &mut *self.queue.get() };
+
+        if let Some(peek) = queue.peek_mut() {
+            let ticket = peek.get();
+
+            Some(ticket.expires)
+        } else {
+            None
+        }
+    }
+
+    /// Set alarm at given instant. If none provided, sets the alarm
+    /// to the maximum supported delay
+    fn set_alarm(&self, expires: Option<HW::Instant>) {
+        self.get_hw_timer().set_alarm(expires);
+    }
+
+    /// Block until alarm expires
+    pub fn wait_for_alarm(&self) {
+        self.get_hw_timer().wait_for_alarm()
+    }
+
+    /// Wake expired tasks, if any
+    pub fn wake_tasks(&self) {
+        while let Some(waker) = self.next_waker() {
+            waker.wake();
+        }
+    }
+
+    /// Return timer for use in tasks
+    pub fn get_timer(self: Pin<&Self>) -> Timer<HW> {
+        let hw = self.hw.get();
+        let sender = self.queue.get();
+
+        Timer::new(hw, sender)
+    }
+
+    /// Run interrupt handler
+    pub fn interrupt_handler(&self) {
+        self.set_alarm(self.next_expiration());
+    }
+
+    /// Return reference to hardware timer
+    pub fn get_hw_timer(&self) -> &HW {
+        unsafe { &*self.hw.get() }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::mut_from_ref)]
+    fn get_hw_timer_mut(&self) -> &mut HW {
+        unsafe { &mut *self.hw.get() }
     }
 }
 
+/// Ticket used in timer queue
+///
+/// Contains expiration time and a waker
 #[derive(Clone)]
-pub struct TickCounterToken {
-    counter: &'static TickCounter,
-}
-
-impl TickCounterToken {
-    pub fn register_waker(&self, waker: &Waker) {
-        self.counter.waker.register(waker);
-    }
-
-    pub fn get_count(&self) -> Tick {
-        self.counter.count
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Ticket {
-    expires: Tick,
+struct Ticket<I> {
+    expires: I,
     waker: Waker,
 }
 
-impl Ticket {
-    fn new(expires: Tick, waker: Waker) -> Self {
+impl<I> Ticket<I> {
+    fn new(expires: I, waker: Waker) -> Self {
         Self { expires, waker }
     }
 }
 
-impl PartialEq for Ticket {
+impl<I> PartialEq for Ticket<I>
+where
+    I: Eq,
+{
     fn eq(&self, other: &Self) -> bool {
         self.expires == other.expires
     }
 }
 
-impl Eq for Ticket {}
+impl<I> Eq for Ticket<I> where I: Eq + Ord {}
 
-impl PartialOrd for Ticket {
+impl<I> PartialOrd for Ticket<I>
+where
+    I: Ord,
+{
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for Ticket {
+impl<I> Ord for Ticket<I>
+where
+    I: Ord,
+{
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         self.expires.cmp(&other.expires)
     }
 }
 
-struct DelayFuture {
-    sender: PrioritySender<Ticket>,
-    counter: TickCounterToken,
-    expires: Tick,
-    started: bool,
+/// Future for delaying a task until a given expiration time
+struct DelayFuture<HW>
+where
+    HW: HardwareTimer,
+{
+    queue: *mut List<Ticket<HW::Instant>>,
+    hw: *const HW,
+    expires: HW::Instant,
+    node: Option<Aliasable<UnsafeCell<Node<Ticket<HW::Instant>>>>>,
 }
 
-impl DelayFuture {
-    fn new(sender: PrioritySender<Ticket>, counter: TickCounterToken, expires: Tick) -> Self {
-        Self {
-            sender,
-            counter,
-            expires,
-            started: false,
+impl<C> Drop for DelayFuture<C>
+where
+    C: HardwareTimer,
+{
+    fn drop(&mut self) {
+        // Make sure to unlink node if dropped before it's popped from
+        // the queue
+        if let Some(node) = &self.node {
+            let node = unsafe { Pin::new_unchecked(node) };
+            let node = node.get().get();
+
+            unsafe { Node::unlink(node) };
         }
     }
 }
 
-impl Future for DelayFuture {
+impl<HW> DelayFuture<HW>
+where
+    HW: HardwareTimer,
+{
+    fn new(queue: *mut List<Ticket<HW::Instant>>, hw: *const HW, expires: HW::Instant) -> Self {
+        Self {
+            queue,
+            hw,
+            expires,
+            node: None,
+        }
+    }
+
+    unsafe fn get_queue_and_node(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> (
+        &mut List<Ticket<HW::Instant>>,
+        &mut Node<Ticket<HW::Instant>>,
+    ) {
+        let queue = unsafe { &mut *self.queue };
+        self.node = Some(Aliasable::new(UnsafeCell::new(Node::new(Ticket::new(
+            self.expires,
+            cx.waker().clone(),
+        )))));
+
+        let node = &mut *Aliasable::get(Pin::new_unchecked(self.node.as_ref().unwrap())).get();
+
+        (queue, node)
+    }
+}
+
+impl<HW> Future for DelayFuture<HW>
+where
+    HW: HardwareTimer,
+{
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.started {
-            if let Err(_) = self
-                .sender
-                .send(Ticket::new(self.expires, cx.waker().clone()))
-            {
-                error!("failed to send ticket");
-            }
-            self.started = true;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { Pin::get_unchecked_mut(self) };
+        let hw = unsafe { &*this.hw };
+
+        // Check if future has been added to the queue yet
+        if this.node.is_none() {
+            // Add node to queue and set alarm. Always return pending
+            // on first await, even if time has already expired
+            let (queue, node) = unsafe { this.get_queue_and_node(cx) };
+            unsafe { queue.insert(node) };
+
+            hw.set_alarm(Some(this.expires));
             Poll::Pending
         } else {
             // Delay until tick count is greater than the
             // expiration. This ensures that we wait for no less than
             // the specified duration, and possibly one tick longer
             // than desired.
-            if self.counter.get_count() > self.expires {
-                Poll::Ready(())
-            } else {
+
+            if this.expires > hw.now() {
+                hw.set_alarm(Some(this.expires));
                 Poll::Pending
+            } else {
+                Poll::Ready(())
             }
         }
     }
 }
 
-pub struct TimeoutFuture<F>
+#[derive(Eq, PartialEq, Debug)]
+pub struct TimeoutError {}
+
+/// Future that wraps around another future, cancelling if awaiting
+/// doesn't finish before the expiration time. Uses `DelayFuture`
+/// under the hood.
+struct TimeoutFuture<F, HW>
 where
     F: Future,
+    HW: HardwareTimer,
 {
     future: F,
-    delay: DelayFuture,
+    delay: DelayFuture<HW>,
 }
 
-impl<F> TimeoutFuture<F>
+impl<F, HW> TimeoutFuture<F, HW>
 where
     F: Future,
+    HW: HardwareTimer,
 {
     fn new(
         future: F,
-        sender: PrioritySender<Ticket>,
-        counter: TickCounterToken,
-        expires: Tick,
+        sender: *mut List<Ticket<HW::Instant>>,
+        hw: *const HW,
+        expires: HW::Instant,
     ) -> Self {
         Self {
             future,
-            delay: DelayFuture::new(sender, counter, expires),
+            delay: DelayFuture::new(sender, hw, expires),
         }
     }
 }
 
-impl<F> Future for TimeoutFuture<F>
+impl<F, HW> Future for TimeoutFuture<F, HW>
 where
     F: Future,
+    HW: HardwareTimer,
 {
-    type Output = Result<F::Output, ()>;
+    type Output = Result<F::Output, TimeoutError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let (future, delay) = unsafe {
@@ -190,462 +340,663 @@ where
             )
         };
 
+        // Poll the inner future first, then if it not ready, check
+        // to see if the delay has expired
         if let Poll::Ready(ret) = future.poll(cx) {
             Poll::Ready(Ok(ret))
+        } else if let Poll::Ready(()) = delay.poll(cx) {
+            // If the delay has expired, return a timeout error
+            Poll::Ready(Err(TimeoutError {}))
         } else {
-            if let Poll::Ready(()) = delay.poll(cx) {
-                Poll::Ready(Err(()))
-            } else {
-                Poll::Pending
-            }
+            Poll::Pending
         }
     }
 }
 
+/// Periodic delay maintaing a constant frequency.
+///
+/// Create with [`Timer::periodic`].
+pub struct Periodic<HW>
+where
+    HW: HardwareTimer,
+{
+    queue: *mut List<Ticket<HW::Instant>>,
+    hw: *const HW,
+    period: HW::Duration,
+    previous: HW::Instant,
+}
+
+impl<HW> Periodic<HW>
+where
+    HW: HardwareTimer,
+{
+    fn new(queue: *mut List<Ticket<HW::Instant>>, hw: *const HW, period: HW::Duration) -> Self {
+        let previous = unsafe { (*hw).now() };
+
+        Self {
+            queue,
+            hw,
+            period,
+            previous,
+        }
+    }
+
+    /// Wait till next period
+    pub fn wait(&mut self) -> impl Future<Output = ()> {
+        self.previous += self.period;
+
+        DelayFuture::new(self.queue, self.hw, self.previous)
+    }
+}
+
+/// Handle for timer
 #[derive(Clone)]
-pub struct Timer {
-    rate: Hertz,
-    counter: TickCounterToken,
-    sender: PrioritySender<Ticket>,
+pub struct Timer<HW>
+where
+    HW: HardwareTimer,
+{
+    hw: *const HW,
+    sender: *mut List<Ticket<HW::Instant>>,
 }
 
-impl Timer {
-    pub fn new(rate: Hertz, counter: TickCounterToken, sender: PrioritySender<Ticket>) -> Self {
-        Self {
-            rate,
-            counter,
-            sender,
-        }
+impl<HW> Timer<HW>
+where
+    HW: HardwareTimer,
+{
+    fn new(hw: *const HW, sender: *mut List<Ticket<HW::Instant>>) -> Self {
+        Self { hw, sender }
     }
 
-    fn get_rate(&self) -> Hertz {
-        self.rate
+    /// Get expiration time from duration
+    fn expiration(&self, duration: HW::Duration) -> HW::Instant {
+        (unsafe { (*self.hw).now() }) + duration
     }
 
-    fn get_count(&self) -> Tick {
-        self.counter.get_count()
+    /// Delay for duration
+    ///
+    /// # Example
+    /// ```
+    /// # use hyperloop::timer::TimerQueue;
+    /// # use hyperloop::timer::std::StdTimer;
+    /// # use std::time::Duration;
+    /// # use std::pin::pin;
+    /// # let mut queue = pin!(TimerQueue::new(StdTimer::new()));
+    /// # let timer = queue.as_ref().get_timer();
+    /// timer.delay(Duration::from_millis(1));
+    /// ```
+    pub fn delay(&self, duration: HW::Duration) -> impl Future<Output = ()> {
+        self.delay_until(self.expiration(duration))
     }
 
-    fn delay_to_ticks<D: Duration + Into<Milliseconds>>(&self, duration: D) -> Tick {
-        let ms: Milliseconds = duration.into();
-        let rate = self.get_rate().to_duration::<Milliseconds>().unwrap();
-
-        assert!(ms.integer() == 0 || ms >= rate);
-
-        let ticks: Tick = (ms.integer() / rate.integer()).into();
-
-        self.get_count() + ticks
+    /// Delay until deadline
+    ///
+    /// # Example
+    /// ```
+    /// # use hyperloop::timer::TimerQueue;
+    /// # use hyperloop::timer::std::StdTimer;
+    /// # use std::time::Duration;
+    /// # use std::pin::pin;
+    /// # let mut queue = pin!(TimerQueue::new(StdTimer::new()));
+    /// # let timer = queue.as_ref().get_timer();
+    /// timer.delay_until(timer.now() + Duration::from_millis(10));
+    /// ```
+    pub fn delay_until(&self, deadline: HW::Instant) -> impl Future<Output = ()> {
+        DelayFuture::new(self.sender, self.hw, deadline)
     }
 
-    pub fn delay(&self, duration: Milliseconds) -> impl Future {
-        DelayFuture::new(
-            self.sender.clone(),
-            self.counter.clone(),
-            self.delay_to_ticks(duration),
-        )
+    /// Drop future if not ready by expiration
+    ///
+    /// # Example
+    /// ```
+    /// # use hyperloop::timer::TimerQueue;
+    /// # use hyperloop::timer::std::StdTimer;
+    /// # use hyperloop::task::yield_now;
+    /// # use std::time::Duration;
+    /// # use std::pin::pin;
+    /// # let mut queue = pin!(TimerQueue::new(StdTimer::new()));
+    /// # let timer = queue.as_ref().get_timer();
+    /// async fn never_ends() {
+    ///     loop {
+    ///         yield_now().await;
+    ///     }
+    /// }
+    ///
+    /// timer.timeout(never_ends(), Duration::from_millis(100));
+    /// ```
+    pub fn timeout<F: Future>(
+        &self,
+        future: F,
+        duration: HW::Duration,
+    ) -> impl Future<Output = Result<F::Output, TimeoutError>> {
+        TimeoutFuture::new(future, self.sender, self.hw, self.expiration(duration))
     }
 
-    pub fn timeout<F: Future>(&self, future: F, duration: Milliseconds) -> TimeoutFuture<F> {
-        TimeoutFuture::new(
-            future,
-            self.sender.clone(),
-            self.counter.clone(),
-            self.delay_to_ticks(duration),
-        )
-    }
-}
+    /// Consistent periodic delay without drift
+    ///
+    /// # Example
+    /// ```
+    /// # use hyperloop::timer::{Timer, HardwareTimer};
+    /// # async fn periodic_task<HW: HardwareTimer>(timer: Timer<HW>, period: HW::Duration) {
+    /// let mut periodic = timer.periodic(period);
+    ///
+    /// loop {
+    ///     // Do some periodic work here
+    ///
+    ///     // Wait until next period
+    ///     periodic.wait().await;
+    /// }
+    /// # }
+    /// ```
 
-struct TimerFuture {
-    counter: TickCounterToken,
-    expires: Option<Tick>,
-}
-
-impl TimerFuture {
-    fn new(counter: TickCounterToken) -> Self {
-        Self {
-            counter,
-            expires: None,
-        }
-    }
-}
-
-impl Stream for TimerFuture {
-    type Item = ();
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(expires) = self.expires {
-            if self.counter.get_count() >= expires {
-                self.expires = None;
-                return Poll::Ready(Some(()));
-            }
-        } else {
-            self.expires = Some(self.counter.get_count() + 1_u64);
-        }
-
-        self.counter.register_waker(cx.waker());
-        Poll::Pending
-    }
-}
-
-pub struct Scheduler<const N: usize> {
-    rate: Hertz,
-    counter: TickCounterToken,
-    queue: PriorityQueue<Ticket, Min, N>,
-}
-
-impl<const N: usize> Scheduler<N> {
-    pub fn new(rate: Hertz, counter: TickCounterToken) -> Self {
-        Self {
-            rate,
-            counter,
-            queue: PriorityQueue::new(),
-        }
+    pub fn periodic(&self, duration: HW::Duration) -> Periodic<HW> {
+        Periodic::new(self.sender, self.hw, duration)
     }
 
-    pub fn get_timer(&self) -> Timer {
-        Timer::new(self.rate, self.counter.clone(), self.queue.get_sender())
-    }
-
-    fn next_waker(&mut self) -> Option<Waker> {
-        if let Some(ticket) = self.queue.peek_mut().as_mut() {
-            if self.counter.get_count() > ticket.expires {
-                return Some(PeekMut::pop(ticket).waker);
-            }
-        }
-
-        None
-    }
-
-    pub async fn task(&mut self) {
-        let mut timer = TimerFuture::new(self.counter.clone());
-
-        loop {
-            if let Some(waker) = self.next_waker() {
-                waker.wake();
-            } else {
-                timer.next().await.unwrap()
-            }
-        }
+    /// Return current time
+    pub fn now(&self) -> HW::Instant {
+        unsafe { (*self.hw).now() }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::Ordering;
+    use ::std::pin::pin;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::time::Duration;
 
-    use crate::common::tests::{log_init, MockWaker};
+    use crate::common::tests::MockWaker;
     use crate::executor::Executor;
     use crate::task::Task;
 
     use super::*;
 
-    use core::future::Future;
+    use ::std::sync::Arc;
     use crossbeam_queue::ArrayQueue;
-    use embedded_time::duration::Extensions as Ext;
-    use embedded_time::rate::Extensions;
-    use std::{boxed::Box, sync::Arc};
+
+    const TICK: Duration = Duration::from_millis(1);
+
+    #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+    struct MockInstant {
+        instant: Duration,
+    }
+
+    impl MockInstant {
+        fn from_ticks(ticks: u32) -> Self {
+            Self {
+                instant: TICK * ticks,
+            }
+        }
+
+        fn ticks(&self) -> u128 {
+            self.instant.as_millis()
+        }
+    }
+
+    impl Add<Duration> for MockInstant {
+        type Output = Self;
+
+        fn add(self, rhs: Duration) -> Self::Output {
+            let instant = self.instant + rhs;
+
+            Self { instant }
+        }
+    }
+
+    impl AddAssign<Duration> for MockInstant {
+        fn add_assign(&mut self, rhs: Duration) {
+            self.instant += rhs;
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockHardwareTimer {
+        time: Duration,
+    }
+
+    impl MockHardwareTimer {
+        fn new() -> Self {
+            Self {
+                time: Duration::ZERO,
+            }
+        }
+
+        fn add(&mut self, duration: Duration) {
+            self.time = self.time.checked_add(duration).unwrap();
+        }
+
+        fn tick(&mut self) {
+            self.add(TICK);
+        }
+
+        fn ticks(&self) -> u128 {
+            self.time.as_millis()
+        }
+    }
+
+    impl HardwareTimer for MockHardwareTimer {
+        type Instant = MockInstant;
+        type Duration = Duration;
+
+        fn now(&self) -> Self::Instant {
+            MockInstant { instant: self.time }
+        }
+
+        fn set_alarm(&self, _duration: Option<Self::Instant>) {}
+
+        fn start(&self) {}
+
+        fn wait_for_alarm(&self) {}
+    }
 
     #[test]
     fn state() {
-        let counter = Box::leak(Box::new(TickCounter::new()));
-        let token = counter.get_token();
+        let queue = TimerQueue::new(MockHardwareTimer::new());
 
-        assert_eq!(token.get_count(), 0);
-
-        unsafe { counter.increment() };
-        assert_eq!(token.get_count(), 1);
-
-        let mockwaker = Arc::new(MockWaker::new());
-        let waker: Waker = mockwaker.clone().into();
-
-        token.register_waker(&waker);
-        counter.wake();
-
-        assert_eq!(mockwaker.woke.load(Ordering::Relaxed), true);
-
-        mockwaker.woke.store(false, Ordering::Relaxed);
-        token.register_waker(&waker);
+        assert_eq!(unsafe { (*queue.hw.get()).ticks() }, 0);
+        assert_eq!(unsafe { (*queue.hw.get()).ticks() }, 0);
 
         unsafe {
-            counter.tick();
+            (*queue.hw.get()).tick();
         }
-        assert_eq!(token.get_count(), 2);
-        assert_eq!(mockwaker.woke.load(Ordering::Relaxed), true);
+
+        assert_eq!(unsafe { (*queue.hw.get()).ticks() }, 1);
+
+        unsafe {
+            (*queue.hw.get()).tick();
+        }
+
+        assert_eq!(unsafe { (*queue.hw.get()).ticks() }, 2);
     }
 
     #[test]
     fn delay() {
-        let counter = Box::leak(Box::new(TickCounter::new()));
-        let token = counter.get_token();
-        let scheduler: &'static mut Scheduler<10> =
-            Box::leak(Box::new(Scheduler::new(1000.Hz(), token.clone())));
-        let sender = scheduler.queue.get_sender();
+        let queue = pin!(TimerQueue::new(MockHardwareTimer::new()));
+        let timer = queue.as_ref().get_timer();
+
         let mockwaker = Arc::new(MockWaker::new());
         let waker: Waker = mockwaker.clone().into();
         let mut cx = Context::from_waker(&waker);
 
-        let mut future = DelayFuture::new(sender.clone(), token.clone(), 1);
+        let mut future1 = DelayFuture::new(timer.sender, timer.hw, MockInstant::from_ticks(1));
 
-        assert_eq!(Pin::new(&mut future).poll(&mut cx), Poll::Pending);
-        assert_eq!(Pin::new(&mut future).poll(&mut cx), Poll::Pending);
-        assert_eq!(Pin::new(&mut future).poll(&mut cx), Poll::Pending);
-        assert_eq!(future.started, true);
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future1).poll(&mut cx) },
+            Poll::Pending
+        );
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future1).poll(&mut cx) },
+            Poll::Pending
+        );
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future1).poll(&mut cx) },
+            Poll::Pending
+        );
+
+        assert!(queue.next_waker().is_none());
 
         unsafe {
-            counter.tick();
-            counter.tick();
+            (*queue.hw.get()).tick();
+        }
+        unsafe {
+            (*queue.hw.get()).tick();
         }
 
-        assert_eq!(Pin::new(&mut future).poll(&mut cx), Poll::Ready(()));
+        let waker = queue.next_waker().unwrap();
 
-        let mut future = DelayFuture::new(sender.clone(), token.clone(), 20);
+        waker.wake();
+        assert!(mockwaker.woke.load(Ordering::Relaxed));
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future1).poll(&mut cx) },
+            Poll::Ready(())
+        );
+    }
 
-        assert_eq!(Pin::new(&mut future).poll(&mut cx), Poll::Pending);
+    #[test]
+    fn delay2() {
+        let queue = pin!(TimerQueue::new(MockHardwareTimer::new()));
+        let timer = queue.as_ref().get_timer();
 
-        let mut future = DelayFuture::new(sender.clone(), token.clone(), 15);
+        let mockwaker = Arc::new(MockWaker::new());
+        let waker: Waker = mockwaker.clone().into();
+        let mut cx = Context::from_waker(&waker);
 
-        assert_eq!(Pin::new(&mut future).poll(&mut cx), Poll::Pending);
+        let mut future1 = DelayFuture::new(timer.sender, timer.hw, MockInstant::from_ticks(1));
 
-        if let Some(ticket) = scheduler.queue.pop() {
-            assert_eq!(ticket.expires, 1);
-            ticket.waker.wake();
-            assert_eq!(mockwaker.woke.load(Ordering::Relaxed), true)
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future1).poll(&mut cx) },
+            Poll::Pending
+        );
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future1).poll(&mut cx) },
+            Poll::Pending
+        );
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future1).poll(&mut cx) },
+            Poll::Pending
+        );
+
+        unsafe {
+            (*queue.hw.get()).tick();
+        }
+        unsafe {
+            (*queue.hw.get()).tick();
         }
 
-        if let Some(ticket) = scheduler.queue.pop() {
-            assert_eq!(ticket.expires, 15);
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future1).poll(&mut cx) },
+            Poll::Ready(())
+        );
+
+        let mut future2 = DelayFuture::new(timer.sender, timer.hw, MockInstant::from_ticks(20));
+
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future2).poll(&mut cx) },
+            Poll::Pending
+        );
+
+        let mut future3 = DelayFuture::new(timer.sender, timer.hw, MockInstant::from_ticks(15));
+
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future3).poll(&mut cx) },
+            Poll::Pending
+        );
+
+        if let Some(ticket) = unsafe { (*queue.queue.get()).pop() } {
+            let ticket = unsafe { &*ticket };
+            assert_eq!(ticket.expires.ticks(), 1);
+            ticket.waker.wake_by_ref();
+            assert!(mockwaker.woke.load(Ordering::Relaxed))
         }
 
-        if let Some(ticket) = scheduler.queue.pop() {
-            assert_eq!(ticket.expires, 20);
+        if let Some(ticket) = unsafe { (*queue.queue.get()).pop() } {
+            let ticket = unsafe { &*ticket };
+            assert_eq!(ticket.expires.ticks(), 15);
         }
+
+        if let Some(ticket) = unsafe { (*queue.queue.get()).pop() } {
+            let ticket = unsafe { &*ticket };
+            assert_eq!(ticket.expires.ticks(), 20);
+        }
+    }
+
+    #[test]
+    fn delay_until() {
+        let queue = pin!(TimerQueue::new(MockHardwareTimer::new()));
+        let timer = queue.as_ref().get_timer();
+
+        let mockwaker = Arc::new(MockWaker::new());
+        let waker: Waker = mockwaker.clone().into();
+        let mut cx = Context::from_waker(&waker);
+
+        unsafe {
+            (*queue.hw.get()).tick();
+        }
+
+        let mut future1 = timer.delay_until(MockInstant::from_ticks(0));
+
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future1).poll(&mut cx) },
+            Poll::Pending
+        );
+
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future1).poll(&mut cx) },
+            Poll::Ready(())
+        );
+
+        let mut future1 = timer.delay_until(MockInstant::from_ticks(2));
+
+        for _ in 0..3 {
+            assert_eq!(
+                unsafe { Pin::new_unchecked(&mut future1).poll(&mut cx) },
+                Poll::Pending
+            );
+        }
+
+        unsafe {
+            (*queue.hw.get()).tick();
+            (*queue.hw.get()).tick();
+        }
+
+        assert_eq!(
+            unsafe { Pin::new_unchecked(&mut future1).poll(&mut cx) },
+            Poll::Ready(())
+        );
     }
 
     #[test]
     fn timer() {
-        let counter = Box::leak(Box::new(TickCounter::new()));
-        let token = counter.get_token();
-        let scheduler: &'static mut Scheduler<10> =
-            Box::leak(Box::new(Scheduler::new(1000.Hz(), token.clone())));
-        let timer = scheduler.get_timer();
-        let mut executor = Box::new(Executor::<10>::new());
-        let queue = Arc::new(ArrayQueue::new(10));
-
-        log_init();
+        let queue = pin!(TimerQueue::new(MockHardwareTimer::new()));
+        let timer = queue.as_ref().get_timer();
 
         let test_future = |queue, timer| {
-            move || {
-                async fn future(queue: Arc<ArrayQueue<u32>>, timer: Timer) {
-                    queue.push(1).unwrap();
+            async fn future(queue: Arc<ArrayQueue<u32>>, timer: Timer<MockHardwareTimer>) {
+                queue.push(1).unwrap();
 
-                    timer.delay(0.milliseconds()).await;
+                timer.delay(Duration::ZERO).await;
 
-                    queue.push(2).unwrap();
+                queue.push(2).unwrap();
 
-                    timer.delay(1.milliseconds()).await;
+                timer.delay(TICK).await;
 
-                    queue.push(3).unwrap();
+                queue.push(3).unwrap();
 
-                    timer.delay(1.milliseconds()).await;
+                timer.delay(TICK).await;
 
-                    queue.push(4).unwrap();
+                queue.push(4).unwrap();
 
-                    timer.delay(1.milliseconds()).await;
+                timer.delay(TICK).await;
 
-                    queue.push(5).unwrap();
+                queue.push(5).unwrap();
 
-                    timer.delay(10.milliseconds()).await;
+                timer.delay(TICK * 10).await;
 
-                    queue.push(6).unwrap();
-                }
-
-                future(queue, timer)
+                queue.push(6).unwrap();
             }
+
+            future(queue, timer)
         };
 
-        let task1 = Task::new(move || scheduler.task(), 1);
-        let task2 = Task::new(test_future(queue.clone(), timer.clone()), 1);
+        let array_queue = Arc::new(ArrayQueue::new(10));
 
-        task1.add_to_executor(executor.get_sender()).unwrap();
-        task2.add_to_executor(executor.get_sender()).unwrap();
+        let mut task = Task::new(test_future(array_queue.clone(), timer.clone()), 1);
 
-        unsafe {
-            executor.poll_tasks();
-        }
+        let mut executor = Executor::new([unsafe { Pin::new_unchecked(&mut task).get_handle() }]);
+        let mut executor_handle = unsafe { Pin::new_unchecked(&mut executor).get_handle() };
 
-        assert_eq!(queue.pop(), Some(1));
-        assert_eq!(queue.pop(), None);
+        executor_handle.poll_tasks();
 
-        unsafe {
-            counter.tick();
-        }
-        unsafe {
-            executor.poll_tasks();
-        }
-
-        assert_eq!(queue.pop(), Some(2));
-        assert_eq!(queue.pop(), None);
-
-        counter.wake();
-        unsafe {
-            executor.poll_tasks();
-        }
-
-        assert_eq!(queue.pop(), None);
+        assert_eq!(array_queue.pop(), Some(1));
+        assert_eq!(array_queue.pop(), None);
 
         unsafe {
-            counter.tick();
+            (*queue.hw.get()).tick();
         }
-        unsafe {
-            counter.tick();
-        }
-        unsafe {
-            executor.poll_tasks();
-        }
+        queue.wake_tasks();
+        executor_handle.poll_tasks();
 
-        assert_eq!(queue.pop(), Some(3));
-        assert_eq!(queue.pop(), None);
+        assert_eq!(array_queue.pop(), Some(2));
+        assert_eq!(array_queue.pop(), None);
 
-        unsafe {
-            counter.tick();
-        }
-        unsafe {
-            counter.tick();
-        }
-        unsafe {
-            executor.poll_tasks();
-        }
+        queue.wake_tasks();
+        executor_handle.poll_tasks();
 
-        assert_eq!(queue.pop(), Some(4));
-        assert_eq!(queue.pop(), None);
+        assert_eq!(array_queue.pop(), None);
 
         unsafe {
-            counter.tick();
+            (*queue.hw.get()).tick();
         }
         unsafe {
-            counter.tick();
+            (*queue.hw.get()).tick();
         }
-        unsafe {
-            executor.poll_tasks();
-        }
+        queue.wake_tasks();
+        executor_handle.poll_tasks();
 
-        assert_eq!(queue.pop(), Some(5));
-        assert_eq!(queue.pop(), None);
+        assert_eq!(array_queue.pop(), Some(3));
+        assert_eq!(array_queue.pop(), None);
+
+        unsafe {
+            (*queue.hw.get()).tick();
+        }
+        unsafe {
+            (*queue.hw.get()).tick();
+        }
+        queue.wake_tasks();
+        executor_handle.poll_tasks();
+
+        assert_eq!(array_queue.pop(), Some(4));
+        assert_eq!(array_queue.pop(), None);
+
+        unsafe {
+            (*queue.hw.get()).tick();
+        }
+        unsafe {
+            (*queue.hw.get()).tick();
+        }
+        queue.wake_tasks();
+        executor_handle.poll_tasks();
+
+        assert_eq!(array_queue.pop(), Some(5));
+        assert_eq!(array_queue.pop(), None);
 
         for _ in 0..10 {
             unsafe {
-                counter.tick();
+                (*queue.hw.get()).tick();
             }
-            unsafe {
-                executor.poll_tasks();
-            }
+            queue.wake_tasks();
+            executor_handle.poll_tasks();
 
-            assert_eq!(queue.pop(), None);
+            assert_eq!(array_queue.pop(), None);
         }
 
         unsafe {
-            counter.tick();
+            (*queue.hw.get()).tick();
         }
-        unsafe {
-            executor.poll_tasks();
-        }
+        queue.wake_tasks();
+        executor_handle.poll_tasks();
 
-        assert_eq!(queue.pop(), Some(6));
-        assert_eq!(queue.pop(), None);
+        assert_eq!(array_queue.pop(), Some(6));
+        assert_eq!(array_queue.pop(), None);
     }
 
     #[test]
-    fn timeout() {
-        let counter = Box::leak(Box::new(TickCounter::new()));
-        let token = counter.get_token();
-        let scheduler: &'static mut Scheduler<10> =
-            Box::leak(Box::new(Scheduler::new(1000.Hz(), token.clone())));
-        let timer = scheduler.get_timer();
-        let mut executor = Executor::<10>::new();
-        let queue = Arc::new(ArrayQueue::new(10));
+    fn nested() {
+        let queue = pin!(TimerQueue::new(MockHardwareTimer::new()));
+        let timer = queue.as_ref().get_timer();
+        let flag = Arc::new(AtomicBool::new(false));
 
-        log_init();
+        async fn inner(timer: Timer<MockHardwareTimer>) {
+            timer.delay(Duration::from_millis(100)).await;
+        }
 
-        let waiting_future = |queue, timer| {
-            move || {
-                async fn slow_future(timer: Timer) {
-                    timer.delay(1000.milliseconds()).await;
-                }
+        async fn outer(timer: Timer<MockHardwareTimer>, flag: Arc<AtomicBool>) {
+            assert_eq!(
+                timer
+                    .timeout(inner(timer.clone()), Duration::from_millis(50))
+                    .await,
+                Err(TimeoutError {})
+            );
 
-                async fn future(queue: Arc<ArrayQueue<u32>>, timer: Timer) {
-                    queue.push(1).unwrap();
+            assert_eq!(
+                timer
+                    .timeout(inner(timer.clone()), Duration::from_millis(200))
+                    .await,
+                Ok(())
+            );
 
-                    assert_eq!(
-                        timer
-                            .timeout(slow_future(timer.clone()), 100.milliseconds())
-                            .await,
-                        Err(())
-                    );
-                    queue.push(2).unwrap();
+            flag.store(true, Ordering::Relaxed);
+        }
 
-                    assert_eq!(
-                        timer
-                            .timeout(slow_future(timer.clone()), 1001.milliseconds())
-                            .await,
-                        Ok(())
-                    );
-                    queue.push(3).unwrap();
-                }
-                future(queue, timer)
-            }
-        };
+        let mut task = Task::new(outer(timer.clone(), flag.clone()), 1);
 
-        let task1 = Task::new(move || scheduler.task(), 1);
-        let task2 = Task::new(waiting_future(queue.clone(), timer), 1);
+        let mut executor = Executor::new([unsafe { Pin::new_unchecked(&mut task).get_handle() }]);
+        let mut handle = unsafe { Pin::new_unchecked(&mut executor).get_handle() };
 
-        task1.add_to_executor(executor.get_sender()).unwrap();
-        task2.add_to_executor(executor.get_sender()).unwrap();
+        handle.poll_tasks();
 
         unsafe {
-            executor.poll_tasks();
+            (*queue.hw.get()).add(Duration::from_millis(51));
         }
 
-        assert_eq!(queue.pop(), Some(1));
-        assert_eq!(queue.pop(), None);
+        queue.wake_tasks();
+        handle.poll_tasks();
 
-        for _ in 0..101 {
-            unsafe {
-                counter.increment();
+        unsafe {
+            (*queue.hw.get()).add(Duration::from_millis(101));
+        }
+
+        queue.wake_tasks();
+        handle.poll_tasks();
+
+        assert!(flag.load(Ordering::Relaxed));
+
+        unsafe {
+            (*queue.hw.get()).add(Duration::from_millis(50));
+        }
+
+        assert!(queue.next_waker().is_none());
+    }
+
+    #[test]
+    fn periodic() {
+        let queue = pin!(TimerQueue::new(MockHardwareTimer::new()));
+        let timer = queue.as_ref().get_timer();
+        let array_queue = Arc::new(ArrayQueue::new(10));
+
+        async fn task(timer: Timer<MockHardwareTimer>, queue: Arc<ArrayQueue<i32>>) {
+            let mut periodic = timer.periodic(Duration::from_millis(100));
+
+            for i in 0..4 {
+                queue.push(i).unwrap();
+                periodic.wait().await;
             }
         }
 
-        counter.wake();
+        let mut task = Task::new(task(timer, array_queue.clone()), 1);
 
-        unsafe {
-            executor.poll_tasks();
-        }
+        let mut executor = Executor::new([unsafe { Pin::new_unchecked(&mut task).get_handle() }]);
+        let mut handle = unsafe { Pin::new_unchecked(&mut executor).get_handle() };
 
-        assert_eq!(queue.pop(), Some(2));
-        assert_eq!(queue.pop(), None);
+        queue.wake_tasks();
+        handle.poll_tasks();
 
-        for _ in 0..1000 {
-            unsafe {
-                counter.increment();
-            }
-            counter.wake();
+        assert_eq!(array_queue.pop(), Some(0));
+        assert_eq!(array_queue.pop(), None);
 
-            unsafe {
-                executor.poll_tasks();
-            }
+        queue.wake_tasks();
+        handle.poll_tasks();
 
-            assert_eq!(queue.pop(), None);
-        }
+        assert_eq!(array_queue.pop(), None);
 
-        unsafe {
-            counter.increment();
-        }
-        counter.wake();
+        queue.get_hw_timer_mut().add(Duration::from_millis(50));
 
-        unsafe {
-            executor.poll_tasks();
-        }
+        queue.wake_tasks();
+        handle.poll_tasks();
 
-        assert_eq!(queue.pop(), Some(3));
-        assert_eq!(queue.pop(), None);
+        assert_eq!(array_queue.pop(), None);
+
+        queue.get_hw_timer_mut().add(Duration::from_millis(51));
+
+        queue.wake_tasks();
+        handle.poll_tasks();
+
+        assert_eq!(array_queue.pop(), Some(1));
+        assert_eq!(array_queue.pop(), None);
+
+        queue.get_hw_timer_mut().add(Duration::from_millis(150));
+
+        queue.wake_tasks();
+        handle.poll_tasks();
+
+        assert_eq!(array_queue.pop(), Some(2));
+        assert_eq!(array_queue.pop(), None);
+
+        queue.get_hw_timer_mut().add(Duration::from_millis(50));
+
+        queue.wake_tasks();
+        handle.poll_tasks();
+
+        assert_eq!(array_queue.pop(), Some(3));
+        assert_eq!(array_queue.pop(), None);
     }
 }

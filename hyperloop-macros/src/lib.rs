@@ -2,15 +2,14 @@
 #![feature(box_into_inner)]
 
 use darling::FromMeta;
-use proc_macro::{self, TokenStream};
+use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
     parse::Parse,
-    parse_quote,
     punctuated::{Pair, Punctuated},
     spanned::Spanned,
     token::Comma,
-    FnArg, Ident, Pat, Stmt, Token,
+    Expr, FnArg, Ident, Pat, Token,
 };
 
 #[derive(Debug, FromMeta)]
@@ -18,7 +17,20 @@ struct TaskArgs {
     priority: u8,
 }
 
-// This macro has liberally borrowed from embassy
+/// Attribute macro for creating statically allocated async task
+///
+/// # Example
+/// ```
+/// #[task(priority = 1)]
+/// async fn task() {
+///     loop {
+///         // Do stuff in here
+///     }
+/// }
+///
+/// let task_handle = task().unwrap();
+/// ```
+///
 #[proc_macro_attribute]
 pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
     let macro_args = syn::parse_macro_input!(args as syn::AttributeArgs);
@@ -69,22 +81,25 @@ pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
 
     let result = quote! {
         #(#attrs)*
-        #visibility fn #name(#args) -> Option<&'static mut crate::task::Task<#future_type>> {
-            type F = #future_type;
+        #visibility fn #name(#args) -> Option<::hyperloop::task::TaskHandle> {
+            mod inner {
+                use super::*;
 
-            fn wrapper(#args) -> impl FnOnce() -> F {
-                move || {
+                pub type F = #future_type;
+
+                pub fn wrapper(#args) -> F {
                     #task_fn
                     task(#arg_values)
                 }
             }
 
-            static mut TASK: Option<Task<F>> = None;
+            static mut TASK: Option<::hyperloop::task::Task<inner::F>> = None;
 
             unsafe {
-                if let None = TASK {
-                    TASK = Some(Task::new(wrapper(#arg_values), #priority));
-                    Some(TASK.as_mut().unwrap())
+                if TASK.is_none() {
+                    TASK = Some(::hyperloop::task::Task::new(inner::wrapper(#arg_values),
+                                                             #priority));
+                    Some(::core::pin::Pin::static_mut(TASK.as_mut().unwrap()).get_handle())
                 } else {
                     None
                 }
@@ -95,60 +110,42 @@ pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 struct Args {
-    args: Punctuated<Ident, Token![,]>,
+    args: Punctuated<Expr, Token![,]>,
 }
 
 impl Parse for Args {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        match Punctuated::<Ident, Token![,]>::parse_terminated(&input) {
+        match Punctuated::<Expr, Token![,]>::parse_terminated(input) {
             Ok(args) => Ok(Self { args }),
             Err(err) => Err(err),
         }
     }
 }
 
-struct Statements {
-    data: Vec<Stmt>,
-}
-
-impl quote::ToTokens for Statements {
-    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
-        for stmt in self.data.iter() {
-            stmt.to_tokens(tokens);
-        }
-    }
-}
-
+/// Macro for creating a static allocator
+///
+/// Returns an [`ExecutorHandle`]
+///
+/// # Example
+/// ```ignore
+/// let mut executor = static_executor!(some_task(), another_task());
+/// ```
 #[proc_macro]
-pub fn executor_from_tasks(tokens: TokenStream) -> TokenStream {
+pub fn static_executor(tokens: TokenStream) -> TokenStream {
     let args = syn::parse_macro_input!(tokens as Args).args;
 
     let n_tasks = args.len();
 
-    let tasks = Statements {
-        data: args
-            .pairs()
-            .map(|pair| {
-                let task = pair.into_value();
-                let stmt: Stmt = parse_quote!(
-                    #task.add_to_executor(executor.get_sender()).unwrap();
-                );
-                stmt
-            })
-            .collect(),
-    };
-
     let result = quote! {
         {
-            static mut EXECUTOR: Option<Executor<#n_tasks>> = None;
+            static mut EXECUTOR: Option<::hyperloop::executor::Executor<#n_tasks>> = None;
+            let args = [#args];
 
             let executor = unsafe {
-                EXECUTOR.get_or_insert(Executor::new())
+                EXECUTOR.get_or_insert(::hyperloop::executor::Executor::new(args))
             };
 
-            #tasks
-
-            executor
+            ::core::pin::Pin::static_mut(executor).get_handle()
         }
     };
 
